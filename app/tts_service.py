@@ -1,25 +1,17 @@
 """
-Text-to-Speech Service mit XTTS v2.
-Unterstützt zwei verschiedene Stimmen für Host und Co-Host.
+Hybrider Text-to-Speech Service.
+Wählt automatisch das beste Backend:
+- XTTS v2 (GPU + Voice Samples) für höchste Qualität
+- Edge TTS (Fallback) für CPU-only Systeme
 """
+import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Optional
-import logging
-import io
-import wave
-import struct
-
-import torch
-from TTS.api import TTS
+from typing import Callable, Optional, Literal
 
 from .config import settings
 
 logger = logging.getLogger(__name__)
-
-# Globale TTS-Instanz (wird beim ersten Aufruf initialisiert)
-_tts_instance: Optional[TTS] = None
-_voices_loaded: bool = False
 
 
 @dataclass
@@ -39,138 +31,182 @@ class SynthesisResult:
     total_duration_ms: int
 
 
-def get_tts_instance() -> TTS:
-    """Gibt die TTS-Instanz zurück, initialisiert sie bei Bedarf."""
-    global _tts_instance
+# TTS Backend Typen
+TTSBackend = Literal["xtts", "edge"]
 
-    if _tts_instance is None:
-        logger.info("Initialisiere XTTS v2...")
-
-        # GPU prüfen
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        logger.info(f"Verwende Device: {device}")
-
-        # XTTS v2 laden
-        _tts_instance = TTS("tts_models/multilingual/multi-dataset/xtts_v2").to(device)
-
-        logger.info("XTTS v2 geladen")
-
-    return _tts_instance
+# Globale Variablen
+_tts_backend: Optional[TTSBackend] = None
+_xtts_instance = None
 
 
-def setup_default_voices():
-    """Prüft und lädt die Standard-Voice-Samples."""
+def _check_gpu_available() -> bool:
+    """Prüft ob CUDA GPU verfügbar ist."""
+    try:
+        import torch
+        available = torch.cuda.is_available()
+        if available:
+            device_name = torch.cuda.get_device_name(0)
+            logger.info(f"GPU gefunden: {device_name}")
+        return available
+    except ImportError:
+        return False
+    except Exception as e:
+        logger.debug(f"GPU-Check fehlgeschlagen: {e}")
+        return False
+
+
+def _check_voice_samples() -> bool:
+    """Prüft ob Voice-Samples vorhanden sind."""
     host_sample = settings.samples_dir / "host.wav"
     cohost_sample = settings.samples_dir / "cohost.wav"
-
-    if not host_sample.exists():
-        logger.warning(f"Host-Sample fehlt: {host_sample}")
-    if not cohost_sample.exists():
-        logger.warning(f"Co-Host-Sample fehlt: {cohost_sample}")
-
-    global _voices_loaded
-    _voices_loaded = host_sample.exists() and cohost_sample.exists()
-
-    return _voices_loaded
+    return host_sample.exists() and cohost_sample.exists()
 
 
-def _get_audio_duration_ms(audio_data: bytes, sample_rate: int) -> int:
-    """Berechnet die Dauer eines Audio-Segments in Millisekunden."""
-    # Annahme: 16-bit Mono WAV
-    num_samples = len(audio_data) // 2
-    duration_seconds = num_samples / sample_rate
-    return int(duration_seconds * 1000)
+def _check_xtts_available() -> bool:
+    """Prüft ob XTTS v2 verwendbar ist."""
+    try:
+        # TTS-Bibliothek importieren
+        from TTS.api import TTS
+        return True
+    except ImportError:
+        return False
+    except Exception as e:
+        logger.debug(f"XTTS nicht verfügbar: {e}")
+        return False
 
 
-def _tensor_to_wav_bytes(audio_tensor: torch.Tensor, sample_rate: int) -> bytes:
-    """Konvertiert einen Audio-Tensor zu WAV-Bytes."""
-    # Normalisieren auf [-1, 1]
-    audio = audio_tensor.cpu().numpy()
-    if audio.max() > 1.0 or audio.min() < -1.0:
-        audio = audio / max(abs(audio.max()), abs(audio.min()))
-
-    # In 16-bit Integer konvertieren
-    audio_int16 = (audio * 32767).astype("int16")
-
-    # WAV-Datei in Memory erstellen
-    buffer = io.BytesIO()
-    with wave.open(buffer, "wb") as wav_file:
-        wav_file.setnchannels(1)
-        wav_file.setsampwidth(2)  # 16-bit
-        wav_file.setframerate(sample_rate)
-        wav_file.writeframes(audio_int16.tobytes())
-
-    return buffer.getvalue()
-
-
-def synthesize_text(
-    text: str,
-    speaker: str = "host",
-    emotion: str = "neutral"
-) -> AudioSegment:
+def detect_best_backend() -> TTSBackend:
     """
-    Synthetisiert einen Text zu Audio.
+    Erkennt automatisch das beste TTS-Backend.
 
-    Args:
-        text: Der zu synthetisierende Text
-        speaker: "host" oder "cohost"
-        emotion: Emotion (aktuell nicht verwendet)
-
-    Returns:
-        AudioSegment mit den Audio-Daten
+    Priorität:
+    1. XTTS v2 wenn GPU + Voice Samples + TTS-Bibliothek verfügbar
+    2. Edge TTS als Fallback
     """
-    tts = get_tts_instance()
+    global _tts_backend
 
-    # Voice-Sample auswählen
+    if _tts_backend is not None:
+        return _tts_backend
+
+    # Prüfe XTTS-Voraussetzungen
+    has_gpu = _check_gpu_available()
+    has_samples = _check_voice_samples()
+    has_xtts = _check_xtts_available()
+
+    logger.info(f"TTS-Backend-Erkennung: GPU={has_gpu}, Samples={has_samples}, XTTS={has_xtts}")
+
+    if has_gpu and has_samples and has_xtts:
+        _tts_backend = "xtts"
+        logger.info("TTS-Backend: XTTS v2 (GPU + Voice Cloning)")
+    else:
+        _tts_backend = "edge"
+        if not has_gpu:
+            logger.info("TTS-Backend: Edge TTS (keine GPU gefunden)")
+        elif not has_samples:
+            logger.info("TTS-Backend: Edge TTS (keine Voice-Samples)")
+        else:
+            logger.info("TTS-Backend: Edge TTS (XTTS nicht installiert)")
+
+    return _tts_backend
+
+
+def _get_xtts_instance():
+    """Lädt XTTS v2 Modell (lazy loading)."""
+    global _xtts_instance
+
+    if _xtts_instance is not None:
+        return _xtts_instance
+
+    from TTS.api import TTS
+    import torch
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    logger.info(f"Lade XTTS v2 auf {device}...")
+
+    _xtts_instance = TTS("tts_models/multilingual/multi-dataset/xtts_v2").to(device)
+    logger.info("XTTS v2 geladen")
+
+    return _xtts_instance
+
+
+def synthesize_text_xtts(text: str, speaker: str = "host") -> AudioSegment:
+    """Synthetisiert Text mit XTTS v2."""
+    import tempfile
+    import wave
+    import io
+
+    tts = _get_xtts_instance()
+
+    # Voice Sample auswählen
     sample_path = settings.samples_dir / f"{speaker}.wav"
     if not sample_path.exists():
-        raise FileNotFoundError(f"Voice-Sample nicht gefunden: {sample_path}")
+        sample_path = settings.samples_dir / "host.wav"
 
-    # Text synthetisieren
-    audio_tensor = tts.tts(
-        text=text,
-        speaker_wav=str(sample_path),
-        language=settings.tts_language
-    )
+    # Synthese
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+        tmp_path = Path(tmp.name)
 
-    # Zu Tensor konvertieren falls nötig
-    if not isinstance(audio_tensor, torch.Tensor):
-        audio_tensor = torch.tensor(audio_tensor)
+    try:
+        tts.tts_to_file(
+            text=text,
+            file_path=str(tmp_path),
+            speaker_wav=str(sample_path),
+            language="de"
+        )
 
-    # In WAV konvertieren
-    sample_rate = settings.tts_sample_rate
-    audio_bytes = _tensor_to_wav_bytes(audio_tensor, sample_rate)
+        # WAV lesen
+        wav_data = tmp_path.read_bytes()
 
-    # Dauer berechnen
-    duration_ms = int(len(audio_tensor) / sample_rate * 1000)
+        # Dauer ermitteln
+        buffer = io.BytesIO(wav_data)
+        with wave.open(buffer, 'rb') as wav:
+            frames = wav.getnframes()
+            rate = wav.getframerate()
+            duration_ms = int(frames / rate * 1000)
 
-    return AudioSegment(
-        audio_data=audio_bytes,
-        duration_ms=duration_ms,
-        speaker=speaker,
-        text=text,
-        sample_rate=sample_rate
-    )
+        return AudioSegment(
+            audio_data=wav_data,
+            duration_ms=duration_ms,
+            speaker=speaker,
+            text=text,
+            sample_rate=24000
+        )
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+
+def synthesize_text_edge(text: str, speaker: str = "host") -> AudioSegment:
+    """Synthetisiert Text mit Edge TTS."""
+    from .edge_tts_service import synthesize_text
+    return synthesize_text(text, speaker)
+
+
+def synthesize_text(text: str, speaker: str = "host") -> AudioSegment:
+    """
+    Synthetisiert Text zu Audio.
+    Wählt automatisch das beste Backend.
+    """
+    backend = detect_best_backend()
+
+    if backend == "xtts":
+        return synthesize_text_xtts(text, speaker)
+    else:
+        return synthesize_text_edge(text, speaker)
 
 
 def synthesize_script(
-    script,  # PodcastScript - vermeidet zirkulären Import
+    script,  # PodcastScript
     progress_callback: Optional[Callable[[int, int], None]] = None
 ) -> SynthesisResult:
     """
     Synthetisiert ein komplettes Podcast-Skript.
-
-    Args:
-        script: PodcastScript mit allen Dialog-Zeilen
-        progress_callback: Optional Callback für Fortschrittsanzeige (current, total)
-
-    Returns:
-        SynthesisResult mit allen Audio-Segmenten
     """
+    backend = detect_best_backend()
     segments = []
     total_duration_ms = 0
-
     total_lines = len(script.lines)
+
+    logger.info(f"Synthetisiere {total_lines} Zeilen mit {backend.upper()}...")
 
     for i, line in enumerate(script.lines):
         if progress_callback:
@@ -179,11 +215,12 @@ def synthesize_script(
         try:
             segment = synthesize_text(
                 text=line.text,
-                speaker=line.speaker,
-                emotion=line.emotion
+                speaker=line.speaker
             )
             segments.append(segment)
             total_duration_ms += segment.duration_ms
+
+            logger.debug(f"Zeile {i+1}/{total_lines}: {segment.duration_ms}ms")
 
         except Exception as e:
             logger.error(f"Fehler bei Zeile {i + 1}: {e}")
@@ -195,6 +232,8 @@ def synthesize_script(
                 text=line.text
             ))
 
+    logger.info(f"Synthese abgeschlossen: {total_duration_ms}ms Gesamtdauer")
+
     return SynthesisResult(
         segments=segments,
         total_duration_ms=total_duration_ms
@@ -203,20 +242,14 @@ def synthesize_script(
 
 class TTSService:
     """
-    Service-Klasse für TTS-Operationen.
-    Kapselt alle TTS-Funktionalität.
+    Hybrider TTS-Service.
+    Wählt automatisch XTTS v2 (GPU) oder Edge TTS (CPU).
     """
 
     def __init__(self):
-        self._tts: Optional[TTS] = None
-
-    def initialize(self):
-        """Initialisiert den TTS-Service."""
-        self._tts = get_tts_instance()
-        setup_default_voices()
+        self.backend = detect_best_backend()
 
     def synthesize_text(self, text: str, speaker: str = "host") -> AudioSegment:
-        """Synthetisiert einen Text."""
         return synthesize_text(text, speaker)
 
     def synthesize_script(
@@ -224,20 +257,40 @@ class TTSService:
         script,
         progress_callback: Optional[Callable[[int, int], None]] = None
     ) -> SynthesisResult:
-        """Synthetisiert ein komplettes Skript."""
         return synthesize_script(script, progress_callback)
 
+    def get_backend_info(self) -> dict:
+        """Gibt Informationen über das verwendete Backend zurück."""
+        return {
+            "backend": self.backend,
+            "gpu_available": _check_gpu_available(),
+            "voice_samples": _check_voice_samples(),
+            "xtts_available": _check_xtts_available() if self.backend == "xtts" else False
+        }
 
-# Singleton-Instanz
+
+# Singleton
 _service_instance: Optional[TTSService] = None
 
 
 def get_tts_service() -> TTSService:
     """Gibt die TTS-Service-Instanz zurück."""
     global _service_instance
-
     if _service_instance is None:
         _service_instance = TTSService()
-        _service_instance.initialize()
-
     return _service_instance
+
+
+def setup_default_voices() -> bool:
+    """Initialisiert das TTS-System und gibt Status zurück."""
+    backend = detect_best_backend()
+
+    if backend == "xtts":
+        logger.info("TTS: XTTS v2 mit Voice Cloning aktiviert")
+        logger.info(f"  Host-Stimme: {settings.samples_dir / 'host.wav'}")
+        logger.info(f"  Co-Host-Stimme: {settings.samples_dir / 'cohost.wav'}")
+    else:
+        from .edge_tts_service import VOICE_HOST, VOICE_COHOST
+        logger.info(f"TTS: Edge TTS - {VOICE_HOST} (Host), {VOICE_COHOST} (Co-Host)")
+
+    return True

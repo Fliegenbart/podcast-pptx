@@ -3,8 +3,9 @@ PPTX-to-Podcast API.
 Accessibility-fokussierte Konvertierung von Präsentationen zu navigierbaren Podcasts.
 """
 from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from pathlib import Path
 from datetime import datetime
 from enum import Enum
@@ -17,9 +18,11 @@ from .config import settings
 from .extractor import extract_pptx
 from .image_describer import describe_images_in_content
 from .dialog_generator import generate_dialog
-from .tts_service import get_tts_service, setup_default_voices
 from .audio_assembly import check_ffmpeg, create_final_audio, get_audio_duration
 from .chapter_manager import ChapterTracker
+
+# Hybrider TTS Service (XTTS v2 mit GPU oder Edge TTS als Fallback)
+from .tts_service import get_tts_service, setup_default_voices
 
 # Logging
 logging.basicConfig(level=logging.INFO)
@@ -40,6 +43,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Statische Dateien
+static_dir = Path(__file__).parent / "static"
+if static_dir.exists():
+    app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
 
 
 # Job-Status
@@ -89,19 +97,8 @@ async def startup():
     if not check_ffmpeg():
         logger.warning("FFmpeg nicht gefunden - Audio-Konvertierung wird fehlschlagen!")
 
-    # Voice-Samples prüfen
-    host_sample = settings.samples_dir / "host.wav"
-    cohost_sample = settings.samples_dir / "cohost.wav"
-
-    if not host_sample.exists() or not cohost_sample.exists():
-        logger.warning(
-            f"Voice-Samples fehlen! Bitte WAV-Dateien bereitstellen:\n"
-            f"  - {host_sample}\n"
-            f"  - {cohost_sample}\n"
-            f"Samples sollten 6-30 Sekunden klar gesprochene Sprache enthalten."
-        )
-    else:
-        setup_default_voices()
+    # Edge TTS prüfen
+    setup_default_voices()
 
     logger.info(f"Output-Format: {settings.output_format}")
     logger.info(f"Bildbeschreibung: {'aktiviert' if settings.image_description_enabled else 'deaktiviert'}")
@@ -109,9 +106,18 @@ async def startup():
     logger.info("Service bereit")
 
 
-@app.get("/")
+@app.get("/", response_class=HTMLResponse)
 async def root():
-    """Health-Check."""
+    """Serve Frontend."""
+    html_path = Path(__file__).parent / "static" / "index.html"
+    if html_path.exists():
+        return html_path.read_text()
+    return HTMLResponse("<h1>PPTX-to-Podcast API</h1><p>Frontend nicht gefunden. Nutze /docs für API.</p>")
+
+
+@app.get("/api")
+async def api_info():
+    """API-Info."""
     return {
         "service": "PPTX-to-Podcast",
         "version": "0.2.0",
@@ -128,17 +134,33 @@ async def root():
 @app.get("/health")
 async def health():
     """Detaillierter Health-Check."""
-    import torch
+    try:
+        import torch
+        gpu_available = torch.cuda.is_available()
+        gpu_name = torch.cuda.get_device_name(0) if gpu_available else None
+    except Exception:
+        gpu_available = False
+        gpu_name = None
+
+    # TTS Backend Info
+    tts = get_tts_service()
+    tts_info = tts.get_backend_info()
+
     return {
         "ffmpeg": check_ffmpeg(),
-        "voice_samples": {
-            "host": (settings.samples_dir / "host.wav").exists(),
-            "cohost": (settings.samples_dir / "cohost.wav").exists()
+        "tts": {
+            "backend": tts_info["backend"],
+            "gpu_accelerated": tts_info["backend"] == "xtts",
+            "voice_samples_available": tts_info["voice_samples"]
         },
-        "gpu_available": torch.cuda.is_available(),
+        "gpu": {
+            "available": gpu_available,
+            "name": gpu_name
+        },
         "models": {
             "dialog": settings.ollama_model,
-            "vision": settings.vision_model if settings.image_description_enabled else "disabled"
+            "vision": settings.vision_model if settings.image_description_enabled else "disabled",
+            "tts": "XTTS v2" if tts_info["backend"] == "xtts" else "Edge TTS"
         }
     }
 

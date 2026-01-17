@@ -3,7 +3,8 @@ Audio-Assembly und -Verarbeitung.
 Kombiniert Audio-Segmente und fügt Audio-Cues ein.
 """
 from pathlib import Path
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
+from dataclasses import dataclass
 import logging
 import subprocess
 import wave
@@ -12,7 +13,24 @@ import struct
 import tempfile
 
 from .config import settings
-from .tts_service import AudioSegment, SynthesisResult
+
+# Lokale Definitionen um zirkuläre Imports zu vermeiden
+@dataclass
+class AudioSegment:
+    """Ein Audio-Segment mit Metadaten."""
+    audio_data: bytes
+    duration_ms: int
+    speaker: str
+    text: str
+    sample_rate: int = 24000
+
+
+@dataclass
+class SynthesisResult:
+    """Ergebnis der Sprach-Synthese."""
+    segments: list[AudioSegment]
+    total_duration_ms: int
+
 
 logger = logging.getLogger(__name__)
 

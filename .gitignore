@@ -8,3 +8,6 @@ samples/
 assets/audio_cues/*.wav
 *.egg-info/
 .DS_Store
+*.bak
+output/
+uploads/
