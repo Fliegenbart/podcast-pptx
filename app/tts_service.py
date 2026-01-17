@@ -1,7 +1,8 @@
 """
 Hybrider Text-to-Speech Service.
 Wählt automatisch das beste Backend:
-- XTTS v2 (GPU + Voice Samples) für höchste Qualität
+- CosyVoice 3 (GPU + Voice Samples) für beste Qualität
+- XTTS v2 (GPU + Voice Samples) als Fallback
 - Edge TTS (Fallback) für CPU-only Systeme
 """
 import logging
@@ -32,7 +33,7 @@ class SynthesisResult:
 
 
 # TTS Backend Typen
-TTSBackend = Literal["xtts", "edge"]
+TTSBackend = Literal["cosyvoice", "xtts", "edge"]
 
 # Globale Variablen
 _tts_backend: Optional[TTSBackend] = None
@@ -75,27 +76,45 @@ def _check_xtts_available() -> bool:
         return False
 
 
+def _check_cosyvoice_available() -> bool:
+    """Prüft ob CosyVoice verfügbar ist."""
+    try:
+        from .cosyvoice_service import check_cosyvoice_available
+        return check_cosyvoice_available()
+    except ImportError:
+        return False
+    except Exception as e:
+        logger.debug(f"CosyVoice nicht verfügbar: {e}")
+        return False
+
+
 def detect_best_backend() -> TTSBackend:
     """
     Erkennt automatisch das beste TTS-Backend.
 
     Priorität:
-    1. XTTS v2 wenn GPU + Voice Samples + TTS-Bibliothek verfügbar
-    2. Edge TTS als Fallback
+    1. CosyVoice 3 wenn GPU + Voice Samples + CosyVoice verfügbar
+    2. XTTS v2 wenn GPU + Voice Samples + TTS-Bibliothek verfügbar
+    3. Edge TTS als Fallback
     """
     global _tts_backend
 
     if _tts_backend is not None:
         return _tts_backend
 
-    # Prüfe XTTS-Voraussetzungen
+    # Prüfe Voraussetzungen
     has_gpu = _check_gpu_available()
     has_samples = _check_voice_samples()
+    has_cosyvoice = _check_cosyvoice_available()
     has_xtts = _check_xtts_available()
 
-    logger.info(f"TTS-Backend-Erkennung: GPU={has_gpu}, Samples={has_samples}, XTTS={has_xtts}")
+    logger.info(f"TTS-Backend-Erkennung: GPU={has_gpu}, Samples={has_samples}, CosyVoice={has_cosyvoice}, XTTS={has_xtts}")
 
-    if has_gpu and has_samples and has_xtts:
+    # CosyVoice 3 hat höchste Priorität
+    if has_gpu and has_samples and has_cosyvoice:
+        _tts_backend = "cosyvoice"
+        logger.info("TTS-Backend: CosyVoice 3 (GPU + Voice Cloning)")
+    elif has_gpu and has_samples and has_xtts:
         _tts_backend = "xtts"
         logger.info("TTS-Backend: XTTS v2 (GPU + Voice Cloning)")
     else:
@@ -105,7 +124,7 @@ def detect_best_backend() -> TTSBackend:
         elif not has_samples:
             logger.info("TTS-Backend: Edge TTS (keine Voice-Samples)")
         else:
-            logger.info("TTS-Backend: Edge TTS (XTTS nicht installiert)")
+            logger.info("TTS-Backend: Edge TTS (kein GPU-TTS verfügbar)")
 
     return _tts_backend
 
@@ -127,6 +146,20 @@ def _get_xtts_instance():
     logger.info("XTTS v2 geladen")
 
     return _xtts_instance
+
+
+def synthesize_text_cosyvoice(text: str, speaker: str = "host") -> AudioSegment:
+    """Synthetisiert Text mit CosyVoice 3."""
+    from .cosyvoice_service import synthesize_text as cosyvoice_synthesize
+    result = cosyvoice_synthesize(text, speaker)
+    # Konvertiere zu lokalem AudioSegment Format
+    return AudioSegment(
+        audio_data=result.audio_data,
+        duration_ms=result.duration_ms,
+        speaker=result.speaker,
+        text=result.text,
+        sample_rate=result.sample_rate
+    )
 
 
 def synthesize_text_xtts(text: str, speaker: str = "host") -> AudioSegment:
@@ -188,7 +221,9 @@ def synthesize_text(text: str, speaker: str = "host") -> AudioSegment:
     """
     backend = detect_best_backend()
 
-    if backend == "xtts":
+    if backend == "cosyvoice":
+        return synthesize_text_cosyvoice(text, speaker)
+    elif backend == "xtts":
         return synthesize_text_xtts(text, speaker)
     else:
         return synthesize_text_edge(text, speaker)
@@ -265,7 +300,8 @@ class TTSService:
             "backend": self.backend,
             "gpu_available": _check_gpu_available(),
             "voice_samples": _check_voice_samples(),
-            "xtts_available": _check_xtts_available() if self.backend == "xtts" else False
+            "cosyvoice_available": _check_cosyvoice_available(),
+            "xtts_available": _check_xtts_available()
         }
 
 
@@ -285,7 +321,11 @@ def setup_default_voices() -> bool:
     """Initialisiert das TTS-System und gibt Status zurück."""
     backend = detect_best_backend()
 
-    if backend == "xtts":
+    if backend == "cosyvoice":
+        logger.info("TTS: CosyVoice 3 mit Voice Cloning aktiviert")
+        logger.info(f"  Host-Stimme: {settings.samples_dir / 'host.wav'}")
+        logger.info(f"  Co-Host-Stimme: {settings.samples_dir / 'cohost.wav'}")
+    elif backend == "xtts":
         logger.info("TTS: XTTS v2 mit Voice Cloning aktiviert")
         logger.info(f"  Host-Stimme: {settings.samples_dir / 'host.wav'}")
         logger.info(f"  Co-Host-Stimme: {settings.samples_dir / 'cohost.wav'}")

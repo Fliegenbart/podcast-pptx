@@ -44,8 +44,12 @@ class Settings(BaseSettings):
     announce_section_changes: bool = True
 
     # TTS
+    tts_backend: Literal["auto", "cosyvoice", "xtts", "edge"] = "auto"
     tts_language: str = "de"
     tts_sample_rate: int = 24000
+
+    # CosyVoice
+    cosyvoice_model: str = "iic/CosyVoice-300M-SFT"  # oder CosyVoice-300M, CosyVoice-500M
 
     # Audio
     audio_bitrate: str = "128k"

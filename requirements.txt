@@ -1,5 +1,5 @@
 # PPTX-to-Podcast Converter
-# Python 3.11+
+# Python 3.10+ (3.10 required for CosyVoice)
 
 # Web Framework
 fastapi>=0.109.0
@@ -14,8 +14,13 @@ Pillow>=10.0.0
 # AI / LLM
 ollama>=0.1.0
 
-# Text-to-Speech
-TTS>=0.22.0
+# Text-to-Speech (Edge TTS - CPU fallback)
+edge-tts>=6.1.0
+
+# Text-to-Speech (XTTS v2 - GPU optional)
+# TTS>=0.22.0
+
+# PyTorch (for GPU TTS)
 torch>=2.0.0
 
 # Audio Processing
@@ -23,3 +28,17 @@ mutagen>=1.47.0
 
 # Utilities
 python-multipart>=0.0.6
+
+# =============================================
+# CosyVoice 3 Setup (optional, beste Qualität)
+# =============================================
+# 1. Git Submodule hinzufügen:
+#    git submodule add https://github.com/FunAudioLLM/CosyVoice.git third_party/CosyVoice
+#    cd third_party/CosyVoice && git submodule update --init --recursive
+#
+# 2. CosyVoice Dependencies installieren:
+#    pip install -r third_party/CosyVoice/requirements.txt
+#
+# 3. Voice Samples in samples/ ablegen:
+#    - samples/host.wav
+#    - samples/cohost.wav
