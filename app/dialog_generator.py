@@ -169,31 +169,58 @@ def _create_orientation_text(slide_number: int, total_slides: int) -> str:
         return f"Wir sind fast durch, noch {total_slides - slide_number + 1} Folien. "
 
 
-def generate_dialog(content: PresentationContent) -> PodcastScript:
-    """
-    Generiert einen Podcast-Dialog aus Präsentationsinhalten.
+def _chunk_slides(slides: list, max_slides_per_chunk: int = 10) -> list[list]:
+    """Teilt Folien in Chunks auf."""
+    chunks = []
+    for i in range(0, len(slides), max_slides_per_chunk):
+        chunks.append(slides[i:i + max_slides_per_chunk])
+    return chunks
 
-    Args:
-        content: Extrahierte Präsentationsinhalte (mit Bildbeschreibungen)
 
-    Returns:
-        PodcastScript mit allen Dialog-Zeilen und Kapitelmarkern
-    """
-    # Prompts vorbereiten
-    system_prompt = DIALOG_SYSTEM_PROMPT.format(
-        host_name=settings.host_name,
-        cohost_name=settings.cohost_name
-    )
+def _generate_chunk_dialog(
+    chunk_slides: list,
+    chunk_index: int,
+    total_chunks: int,
+    total_slides: int,
+    title: str
+) -> list[dict]:
+    """Generiert Dialog für einen Chunk von Folien."""
 
-    user_prompt = DIALOG_USER_PROMPT.format(
-        host_name=settings.host_name,
-        cohost_name=settings.cohost_name,
-        total_slides=content.total_slides,
-        content=content.to_prompt_text()
-    )
+    # Chunk-spezifischen Prompt erstellen
+    chunk_text = []
+    for slide in chunk_slides:
+        chunk_text.append(f"### Folie {slide.slide_number}")
+        chunk_text.append(slide.to_text())
 
-    # Ollama aufrufen
-    logger.info(f"Generiere Dialog mit {settings.ollama_model}...")
+    chunk_content = "\n".join(chunk_text)
+
+    # Kontext-Info für das Modell
+    if chunk_index == 0:
+        context = "Dies ist der ANFANG der Präsentation. Starte mit einer lockeren Begrüßung."
+    elif chunk_index == total_chunks - 1:
+        context = "Dies ist das ENDE der Präsentation. Schließe mit einem Fazit ab."
+    else:
+        context = f"Dies ist Teil {chunk_index + 1} von {total_chunks} der Präsentation. Führe den Dialog natürlich fort."
+
+    system_prompt = f"""Du bist ein Podcast-Skript-Autor. Schreibe natürliche Dialoge zwischen {settings.host_name} (Host) und {settings.cohost_name} (Co-Host).
+
+REGELN:
+- Natürliche Sprache, keine steifen Formulierungen
+- Beschreibe Bilder/Diagramme verbal für blinde Zuhörer
+- Jede Zeile 1-3 Sätze
+- KEINE Emojis
+
+OUTPUT: NUR valides JSON, keine Erklärungen:
+[{{"speaker": "host", "text": "...", "slide": 1}}, {{"speaker": "cohost", "text": "...", "slide": 1}}, ...]"""
+
+    user_prompt = f"""{context}
+
+Präsentation: {title}
+Folien {chunk_slides[0].slide_number} bis {chunk_slides[-1].slide_number} von {total_slides}:
+
+{chunk_content}
+
+Generiere 8-15 Dialog-Zeilen als JSON:"""
 
     response = ollama.chat(
         model=settings.ollama_model,
@@ -203,19 +230,85 @@ def generate_dialog(content: PresentationContent) -> PodcastScript:
         ],
         options={
             "temperature": 0.7,
-            "num_predict": 8192,  # Mehr Token für längere Präsentationen
+            "num_predict": 3000,
         }
     )
 
-    # Response parsen
     raw_response = response['message']['content']
     cleaned_json = clean_json_response(raw_response)
 
     try:
-        dialog_data = json.loads(cleaned_json)
+        return json.loads(cleaned_json)
     except json.JSONDecodeError as e:
-        logger.error(f"JSON-Parse-Fehler: {e}")
-        raise ValueError(f"LLM hat kein valides JSON generiert: {e}\n\nRaw: {raw_response[:500]}")
+        logger.warning(f"JSON-Parse-Fehler in Chunk {chunk_index}: {e}")
+        return []
+
+
+def generate_dialog(content: PresentationContent) -> PodcastScript:
+    """
+    Generiert einen Podcast-Dialog aus Präsentationsinhalten.
+    Bei langen Präsentationen wird in Chunks verarbeitet.
+
+    Args:
+        content: Extrahierte Präsentationsinhalte (mit Bildbeschreibungen)
+
+    Returns:
+        PodcastScript mit allen Dialog-Zeilen und Kapitelmarkern
+    """
+    logger.info(f"Generiere Dialog mit {settings.ollama_model}...")
+
+    # Bei langen Präsentationen: Chunk-Verarbeitung
+    if len(content.slides) > 12:
+        logger.info(f"Lange Präsentation ({len(content.slides)} Folien) - verarbeite in Chunks")
+        chunks = _chunk_slides(content.slides, max_slides_per_chunk=8)
+
+        all_dialog_data = []
+        for i, chunk in enumerate(chunks):
+            logger.info(f"Verarbeite Chunk {i+1}/{len(chunks)} (Folien {chunk[0].slide_number}-{chunk[-1].slide_number})")
+            chunk_dialog = _generate_chunk_dialog(
+                chunk_slides=chunk,
+                chunk_index=i,
+                total_chunks=len(chunks),
+                total_slides=content.total_slides,
+                title=content.title or "Präsentation"
+            )
+            all_dialog_data.extend(chunk_dialog)
+
+        dialog_data = all_dialog_data
+    else:
+        # Kurze Präsentation: Standard-Verarbeitung
+        system_prompt = DIALOG_SYSTEM_PROMPT.format(
+            host_name=settings.host_name,
+            cohost_name=settings.cohost_name
+        )
+
+        user_prompt = DIALOG_USER_PROMPT.format(
+            host_name=settings.host_name,
+            cohost_name=settings.cohost_name,
+            total_slides=content.total_slides,
+            content=content.to_prompt_text()
+        )
+
+        response = ollama.chat(
+            model=settings.ollama_model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            options={
+                "temperature": 0.7,
+                "num_predict": 8192,
+            }
+        )
+
+        raw_response = response['message']['content']
+        cleaned_json = clean_json_response(raw_response)
+
+        try:
+            dialog_data = json.loads(cleaned_json)
+        except json.JSONDecodeError as e:
+            logger.error(f"JSON-Parse-Fehler: {e}")
+            raise ValueError(f"LLM hat kein valides JSON generiert: {e}")
 
     # In DialogLines konvertieren mit Kapitel-Tracking
     lines = []

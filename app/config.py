@@ -17,7 +17,7 @@ class Settings(BaseSettings):
     assets_dir: Path = base_dir / "assets"
 
     # Ollama
-    ollama_model: str = "llama3.1:8b"
+    ollama_model: str = "qwen2.5:14b"
     ollama_host: str = "http://localhost:11434"
 
     # Podcast-Hosts
@@ -25,7 +25,7 @@ class Settings(BaseSettings):
     cohost_name: str = "Sam"
 
     # Accessibility - Bildbeschreibung
-    vision_model: str = "llava:13b"
+    vision_model: str = "llava:latest"
     skip_decorative_images: bool = True
     max_image_description_length: int = 200
     image_description_enabled: bool = True
